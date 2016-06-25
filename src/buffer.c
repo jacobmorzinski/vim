@@ -1649,6 +1649,7 @@ do_autochdir(void)
  * If (flags & BLN_CURBUF) is TRUE, may use current buffer.
  * If (flags & BLN_LISTED) is TRUE, add new buffer to buffer list.
  * If (flags & BLN_DUMMY) is TRUE, don't count it as a real buffer.
+ * If (flags & BLN_NEW) is TRUE, don't use an existing buffer.
  * This is the ONLY way to create a new buffer.
  */
 static int  top_file_num = 1;		/* highest file number */
@@ -1676,7 +1677,7 @@ buflist_new(
     if (sfname == NULL || mch_stat((char *)sfname, &st) < 0)
 	st.st_dev = (dev_T)-1;
 #endif
-    if (ffname != NULL && !(flags & BLN_DUMMY) && (buf =
+    if (ffname != NULL && !(flags & (BLN_DUMMY | BLN_NEW)) && (buf =
 #ifdef UNIX
 		buflist_findname_stat(ffname, &st)
 #else
@@ -2515,7 +2516,7 @@ buflist_findnr(int nr)
 	nr = curwin->w_alt_fnum;
     for (buf = firstbuf; buf != NULL; buf = buf->b_next)
 	if (buf->b_fnum == nr)
-	    return (buf);
+	    return buf;
     return NULL;
 }
 

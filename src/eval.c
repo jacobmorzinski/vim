@@ -349,6 +349,7 @@ static struct vimvar
     {VV_NAME("fcs_choice",	 VAR_STRING), 0},
     {VV_NAME("beval_bufnr",	 VAR_NUMBER), VV_RO},
     {VV_NAME("beval_winnr",	 VAR_NUMBER), VV_RO},
+    {VV_NAME("beval_winid",	 VAR_NUMBER), VV_RO},
     {VV_NAME("beval_lnum",	 VAR_NUMBER), VV_RO},
     {VV_NAME("beval_col",	 VAR_NUMBER), VV_RO},
     {VV_NAME("beval_text",	 VAR_STRING), VV_RO},
@@ -358,6 +359,7 @@ static struct vimvar
     {VV_NAME("swapcommand",	 VAR_STRING), VV_RO},
     {VV_NAME("char",		 VAR_STRING), 0},
     {VV_NAME("mouse_win",	 VAR_NUMBER), 0},
+    {VV_NAME("mouse_winid",	 VAR_NUMBER), 0},
     {VV_NAME("mouse_lnum",	 VAR_NUMBER), 0},
     {VV_NAME("mouse_col",	 VAR_NUMBER), 0},
     {VV_NAME("operator",	 VAR_STRING), VV_RO},
@@ -445,16 +447,17 @@ static long list_idx_of_item(list_T *l, listitem_T *item);
 static int list_extend(list_T	*l1, list_T *l2, listitem_T *bef);
 static int list_concat(list_T *l1, list_T *l2, typval_T *tv);
 static list_T *list_copy(list_T *orig, int deep, int copyID);
-static char_u *list2string(typval_T *tv, int copyID);
-static int list_join_inner(garray_T *gap, list_T *l, char_u *sep, int echo_style, int copyID, garray_T *join_gap);
-static int list_join(garray_T *gap, list_T *l, char_u *sep, int echo, int copyID);
+static char_u *list2string(typval_T *tv, int copyID, int restore_copyID);
+static int list_join_inner(garray_T *gap, list_T *l, char_u *sep, int echo_style, int restore_copyID, int copyID, garray_T *join_gap);
+static int list_join(garray_T *gap, list_T *l, char_u *sep, int echo_style, int restore_copyID, int copyID);
 static int free_unref_items(int copyID);
 static dictitem_T *dictitem_copy(dictitem_T *org);
 static void dictitem_remove(dict_T *dict, dictitem_T *item);
 static dict_T *dict_copy(dict_T *orig, int deep, int copyID);
 static long dict_len(dict_T *d);
-static char_u *dict2string(typval_T *tv, int copyID);
+static char_u *dict2string(typval_T *tv, int copyID, int restore_copyID);
 static int get_dict_tv(char_u **arg, typval_T *rettv, int evaluate);
+static char_u *echo_string_core(typval_T *tv, char_u **tofree, char_u *numbuf, int copyID, int echo_style, int restore_copyID, int dict_val);
 static char_u *echo_string(typval_T *tv, char_u **tofree, char_u *numbuf, int copyID);
 static char_u *string_quote(char_u *str, int function);
 static int get_env_tv(char_u **arg, typval_T *rettv, int evaluate);
@@ -498,6 +501,7 @@ static void f_buflisted(typval_T *argvars, typval_T *rettv);
 static void f_bufloaded(typval_T *argvars, typval_T *rettv);
 static void f_bufname(typval_T *argvars, typval_T *rettv);
 static void f_bufnr(typval_T *argvars, typval_T *rettv);
+static void f_bufwinid(typval_T *argvars, typval_T *rettv);
 static void f_bufwinnr(typval_T *argvars, typval_T *rettv);
 static void f_byte2line(typval_T *argvars, typval_T *rettv);
 static void byteidx(typval_T *argvars, typval_T *rettv, int comp);
@@ -816,6 +820,7 @@ static void f_test_null_job(typval_T *argvars, typval_T *rettv);
 static void f_test_null_list(typval_T *argvars, typval_T *rettv);
 static void f_test_null_partial(typval_T *argvars, typval_T *rettv);
 static void f_test_null_string(typval_T *argvars, typval_T *rettv);
+static void f_test_settime(typval_T *argvars, typval_T *rettv);
 #ifdef FEAT_FLOAT
 static void f_tan(typval_T *argvars, typval_T *rettv);
 static void f_tanh(typval_T *argvars, typval_T *rettv);
@@ -1462,7 +1467,7 @@ eval_to_string(
 	    ga_init2(&ga, (int)sizeof(char), 80);
 	    if (tv.vval.v_list != NULL)
 	    {
-		list_join(&ga, tv.vval.v_list, (char_u *)"\n", TRUE, 0);
+		list_join(&ga, tv.vval.v_list, (char_u *)"\n", TRUE, FALSE, 0);
 		if (tv.vval.v_list->lv_len > 0)
 		    ga_append(&ga, NL);
 	    }
@@ -4626,7 +4631,26 @@ eval4(char_u **arg, typval_T *rettv, int evaluate)
 		    clear_tv(&var2);
 		    return FAIL;
 		}
-		n1 = tv_equal(rettv, &var2, FALSE, FALSE);
+		if ((rettv->v_type == VAR_PARTIAL
+					     && rettv->vval.v_partial == NULL)
+			|| (var2.v_type == VAR_PARTIAL
+					      && var2.vval.v_partial == NULL))
+		    /* when a partial is NULL assume not equal */
+		    n1 = FALSE;
+		else if (type_is)
+		{
+		    if (rettv->v_type == VAR_FUNC && var2.v_type == VAR_FUNC)
+			/* strings are considered the same if their value is
+			 * the same */
+			n1 = tv_equal(rettv, &var2, ic, FALSE);
+		    else if (rettv->v_type == VAR_PARTIAL
+						&& var2.v_type == VAR_PARTIAL)
+			n1 = (rettv->vval.v_partial == var2.vval.v_partial);
+		    else
+			n1 = FALSE;
+		}
+		else
+		    n1 = tv_equal(rettv, &var2, ic, FALSE);
 		if (type == TYPE_NEQUAL)
 		    n1 = !n1;
 	    }
@@ -5297,7 +5321,7 @@ eval7(
 		 * what follows. So set it here. */
 		if (rettv->v_type == VAR_UNKNOWN && !evaluate && **arg == '(')
 		{
-		    rettv->vval.v_string = vim_strsave((char_u *)"");
+		    rettv->vval.v_string = NULL;
 		    rettv->v_type = VAR_FUNC;
 		}
 
@@ -6257,6 +6281,58 @@ dict_equal(
 
 static int tv_equal_recurse_limit;
 
+    static int
+func_equal(
+    typval_T *tv1,
+    typval_T *tv2,
+    int	     ic)	    /* ignore case */
+{
+    char_u	*s1, *s2;
+    dict_T	*d1, *d2;
+    int		a1, a2;
+    int		i;
+
+    /* empty and NULL function name considered the same */
+    s1 = tv1->v_type == VAR_FUNC ? tv1->vval.v_string
+					   : tv1->vval.v_partial->pt_name;
+    if (s1 != NULL && *s1 == NUL)
+	s1 = NULL;
+    s2 = tv2->v_type == VAR_FUNC ? tv2->vval.v_string
+					   : tv2->vval.v_partial->pt_name;
+    if (s2 != NULL && *s2 == NUL)
+	s2 = NULL;
+    if (s1 == NULL || s2 == NULL)
+    {
+	if (s1 != s2)
+	    return FALSE;
+    }
+    else if (STRCMP(s1, s2) != 0)
+	return FALSE;
+
+    /* empty dict and NULL dict is different */
+    d1 = tv1->v_type == VAR_FUNC ? NULL : tv1->vval.v_partial->pt_dict;
+    d2 = tv2->v_type == VAR_FUNC ? NULL : tv2->vval.v_partial->pt_dict;
+    if (d1 == NULL || d2 == NULL)
+    {
+	if (d1 != d2)
+	    return FALSE;
+    }
+    else if (!dict_equal(d1, d2, ic, TRUE))
+	return FALSE;
+
+    /* empty list and no list considered the same */
+    a1 = tv1->v_type == VAR_FUNC ? 0 : tv1->vval.v_partial->pt_argc;
+    a2 = tv2->v_type == VAR_FUNC ? 0 : tv2->vval.v_partial->pt_argc;
+    if (a1 != a2)
+	return FALSE;
+    for (i = 0; i < a1; ++i)
+	if (!tv_equal(tv1->vval.v_partial->pt_argv + i,
+		      tv2->vval.v_partial->pt_argv + i, ic, TRUE))
+	    return FALSE;
+
+    return TRUE;
+}
+
 /*
  * Return TRUE if "tv1" and "tv2" have the same value.
  * Compares the items just like "==" would compare them, but strings and
@@ -6274,22 +6350,6 @@ tv_equal(
     static int  recursive_cnt = 0;	    /* catch recursive loops */
     int		r;
 
-    /* For VAR_FUNC and VAR_PARTIAL only compare the function name. */
-    if ((tv1->v_type == VAR_FUNC
-		|| (tv1->v_type == VAR_PARTIAL && tv1->vval.v_partial != NULL))
-	    && (tv2->v_type == VAR_FUNC
-		|| (tv2->v_type == VAR_PARTIAL && tv2->vval.v_partial != NULL)))
-    {
-	s1 = tv1->v_type == VAR_FUNC ? tv1->vval.v_string
-					       : tv1->vval.v_partial->pt_name;
-	s2 = tv2->v_type == VAR_FUNC ? tv2->vval.v_string
-					       : tv2->vval.v_partial->pt_name;
-	return (s1 != NULL && s2 != NULL && STRCMP(s1, s2) == 0);
-    }
-
-    if (tv1->v_type != tv2->v_type)
-	return FALSE;
-
     /* Catch lists and dicts that have an endless loop by limiting
      * recursiveness to a limit.  We guess they are equal then.
      * A fixed limit has the problem of still taking an awful long time.
@@ -6303,6 +6363,21 @@ tv_equal(
 	--tv_equal_recurse_limit;
 	return TRUE;
     }
+
+    /* For VAR_FUNC and VAR_PARTIAL only compare the function name. */
+    if ((tv1->v_type == VAR_FUNC
+		|| (tv1->v_type == VAR_PARTIAL && tv1->vval.v_partial != NULL))
+	    && (tv2->v_type == VAR_FUNC
+		|| (tv2->v_type == VAR_PARTIAL && tv2->vval.v_partial != NULL)))
+    {
+	++recursive_cnt;
+	r = func_equal(tv1, tv2, ic);
+	--recursive_cnt;
+	return r;
+    }
+
+    if (tv1->v_type != tv2->v_type)
+	return FALSE;
 
     switch (tv1->v_type)
     {
@@ -6766,7 +6841,7 @@ vimlist_remove(list_T *l, listitem_T *item, listitem_T *item2)
  * May return NULL.
  */
     static char_u *
-list2string(typval_T *tv, int copyID)
+list2string(typval_T *tv, int copyID, int restore_copyID)
 {
     garray_T	ga;
 
@@ -6774,7 +6849,8 @@ list2string(typval_T *tv, int copyID)
 	return NULL;
     ga_init2(&ga, (int)sizeof(char), 80);
     ga_append(&ga, '[');
-    if (list_join(&ga, tv->vval.v_list, (char_u *)", ", FALSE, copyID) == FAIL)
+    if (list_join(&ga, tv->vval.v_list, (char_u *)", ",
+				       FALSE, restore_copyID, copyID) == FAIL)
     {
 	vim_free(ga.ga_data);
 	return NULL;
@@ -6795,6 +6871,7 @@ list_join_inner(
     list_T	*l,
     char_u	*sep,
     int		echo_style,
+    int		restore_copyID,
     int		copyID,
     garray_T	*join_gap)	/* to keep each list item string */
 {
@@ -6811,10 +6888,8 @@ list_join_inner(
     /* Stringify each item in the list. */
     for (item = l->lv_first; item != NULL && !got_int; item = item->li_next)
     {
-	if (echo_style)
-	    s = echo_string(&item->li_tv, &tofree, numbuf, copyID);
-	else
-	    s = tv2string(&item->li_tv, &tofree, numbuf, copyID);
+	s = echo_string_core(&item->li_tv, &tofree, numbuf, copyID,
+					   echo_style, restore_copyID, FALSE);
 	if (s == NULL)
 	    return FAIL;
 
@@ -6873,6 +6948,7 @@ list_join(
     list_T	*l,
     char_u	*sep,
     int		echo_style,
+    int		restore_copyID,
     int		copyID)
 {
     garray_T	join_ga;
@@ -6883,7 +6959,8 @@ list_join(
     if (l->lv_len < 1)
 	return OK; /* nothing to do */
     ga_init2(&join_ga, (int)sizeof(join_T), l->lv_len);
-    retval = list_join_inner(gap, l, sep, echo_style, copyID, &join_ga);
+    retval = list_join_inner(gap, l, sep, echo_style, restore_copyID,
+							    copyID, &join_ga);
 
     /* Dispose each item in join_ga. */
     if (join_ga.ga_data != NULL)
@@ -7044,6 +7121,10 @@ garbage_collect(int testing)
 #endif
 #ifdef FEAT_NETBEANS_INTG
     abort = abort || set_ref_in_nb_channel(copyID);
+#endif
+
+#ifdef FEAT_TIMERS
+    abort = abort || set_ref_in_timer(copyID);
 #endif
 
     if (!abort)
@@ -7829,7 +7910,7 @@ get_dict_number(dict_T *d, char_u *key)
  * May return NULL.
  */
     static char_u *
-dict2string(typval_T *tv, int copyID)
+dict2string(typval_T *tv, int copyID, int restore_copyID)
 {
     garray_T	ga;
     int		first = TRUE;
@@ -7864,7 +7945,8 @@ dict2string(typval_T *tv, int copyID)
 		vim_free(tofree);
 	    }
 	    ga_concat(&ga, (char_u *)": ");
-	    s = tv2string(&HI2DI(hi)->di_tv, &tofree, numbuf, copyID);
+	    s = echo_string_core(&HI2DI(hi)->di_tv, &tofree, numbuf, copyID,
+						 FALSE, restore_copyID, TRUE);
 	    if (s != NULL)
 		ga_concat(&ga, s);
 	    vim_free(tofree);
@@ -8022,16 +8104,23 @@ get_var_special_name(int nr)
  * Return a string with the string representation of a variable.
  * If the memory is allocated "tofree" is set to it, otherwise NULL.
  * "numbuf" is used for a number.
- * Does not put quotes around strings, as ":echo" displays values.
  * When "copyID" is not NULL replace recursive lists and dicts with "...".
+ * When both "echo_style" and "dict_val" are FALSE, put quotes around stings as
+ * "string()", otherwise does not put quotes around strings, as ":echo"
+ * displays values.
+ * When "restore_copyID" is FALSE, repeated items in dictionaries and lists
+ * are replaced with "...".
  * May return NULL.
  */
     static char_u *
-echo_string(
+echo_string_core(
     typval_T	*tv,
     char_u	**tofree,
     char_u	*numbuf,
-    int		copyID)
+    int		copyID,
+    int		echo_style,
+    int		restore_copyID,
+    int		dict_val)
 {
     static int	recurse = 0;
     char_u	*r = NULL;
@@ -8053,9 +8142,30 @@ echo_string(
 
     switch (tv->v_type)
     {
+	case VAR_STRING:
+	    if (echo_style && !dict_val)
+	    {
+		*tofree = NULL;
+		r = get_tv_string_buf(tv, numbuf);
+	    }
+	    else
+	    {
+		*tofree = string_quote(tv->vval.v_string, FALSE);
+		r = *tofree;
+	    }
+	    break;
+
 	case VAR_FUNC:
-	    *tofree = NULL;
-	    r = tv->vval.v_string;
+	    if (echo_style)
+	    {
+		*tofree = NULL;
+		r = tv->vval.v_string;
+	    }
+	    else
+	    {
+		*tofree = string_quote(tv->vval.v_string, TRUE);
+		r = *tofree;
+	    }
 	    break;
 
 	case VAR_PARTIAL:
@@ -8110,15 +8220,20 @@ echo_string(
 		*tofree = NULL;
 		r = NULL;
 	    }
-	    else if (copyID != 0 && tv->vval.v_list->lv_copyID == copyID)
+	    else if (copyID != 0 && tv->vval.v_list->lv_copyID == copyID
+		    && tv->vval.v_list->lv_len > 0)
 	    {
 		*tofree = NULL;
 		r = (char_u *)"[...]";
 	    }
 	    else
 	    {
+		int old_copyID = tv->vval.v_list->lv_copyID;
+
 		tv->vval.v_list->lv_copyID = copyID;
-		*tofree = list2string(tv, copyID);
+		*tofree = list2string(tv, copyID, restore_copyID);
+		if (restore_copyID)
+		    tv->vval.v_list->lv_copyID = old_copyID;
 		r = *tofree;
 	    }
 	    break;
@@ -8129,20 +8244,23 @@ echo_string(
 		*tofree = NULL;
 		r = NULL;
 	    }
-	    else if (copyID != 0 && tv->vval.v_dict->dv_copyID == copyID)
+	    else if (copyID != 0 && tv->vval.v_dict->dv_copyID == copyID
+		    && tv->vval.v_dict->dv_hashtab.ht_used != 0)
 	    {
 		*tofree = NULL;
 		r = (char_u *)"{...}";
 	    }
 	    else
 	    {
+		int old_copyID = tv->vval.v_dict->dv_copyID;
 		tv->vval.v_dict->dv_copyID = copyID;
-		*tofree = dict2string(tv, copyID);
+		*tofree = dict2string(tv, copyID, restore_copyID);
+		if (restore_copyID)
+		    tv->vval.v_dict->dv_copyID = old_copyID;
 		r = *tofree;
 	    }
 	    break;
 
-	case VAR_STRING:
 	case VAR_NUMBER:
 	case VAR_UNKNOWN:
 	case VAR_JOB:
@@ -8174,6 +8292,24 @@ echo_string(
  * Return a string with the string representation of a variable.
  * If the memory is allocated "tofree" is set to it, otherwise NULL.
  * "numbuf" is used for a number.
+ * Does not put quotes around strings, as ":echo" displays values.
+ * When "copyID" is not NULL replace recursive lists and dicts with "...".
+ * May return NULL.
+ */
+    static char_u *
+echo_string(
+    typval_T	*tv,
+    char_u	**tofree,
+    char_u	*numbuf,
+    int		copyID)
+{
+    return echo_string_core(tv, tofree, numbuf, copyID, TRUE, FALSE, FALSE);
+}
+
+/*
+ * Return a string with the string representation of a variable.
+ * If the memory is allocated "tofree" is set to it, otherwise NULL.
+ * "numbuf" is used for a number.
  * Puts quotes around strings, so that they can be parsed back by eval().
  * May return NULL.
  */
@@ -8184,31 +8320,7 @@ tv2string(
     char_u	*numbuf,
     int		copyID)
 {
-    switch (tv->v_type)
-    {
-	case VAR_FUNC:
-	    *tofree = string_quote(tv->vval.v_string, TRUE);
-	    return *tofree;
-	case VAR_STRING:
-	    *tofree = string_quote(tv->vval.v_string, FALSE);
-	    return *tofree;
-	case VAR_FLOAT:
-#ifdef FEAT_FLOAT
-	    *tofree = NULL;
-	    vim_snprintf((char *)numbuf, NUMBUFLEN - 1, "%g", tv->vval.v_float);
-	    return numbuf;
-#endif
-	case VAR_NUMBER:
-	case VAR_LIST:
-	case VAR_DICT:
-	case VAR_PARTIAL:
-	case VAR_SPECIAL:
-	case VAR_JOB:
-	case VAR_CHANNEL:
-	case VAR_UNKNOWN:
-	    break;
-    }
-    return echo_string(tv, tofree, numbuf, copyID);
+    return echo_string_core(tv, tofree, numbuf, copyID, FALSE, TRUE, FALSE);
 }
 
 /*
@@ -8379,6 +8491,7 @@ static struct fst
     {"bufloaded",	1, 1, f_bufloaded},
     {"bufname",		1, 1, f_bufname},
     {"bufnr",		1, 2, f_bufnr},
+    {"bufwinid",	1, 1, f_bufwinid},
     {"bufwinnr",	1, 1, f_bufwinnr},
     {"byte2line",	1, 1, f_byte2line},
     {"byteidx",		2, 2, f_byteidx},
@@ -8697,13 +8810,14 @@ static struct fst
 #ifdef FEAT_JOB_CHANNEL
     {"test_null_channel", 0, 0, f_test_null_channel},
 #endif
-    {"test_null_dict", 0, 0, f_test_null_dict},
+    {"test_null_dict",	0, 0, f_test_null_dict},
 #ifdef FEAT_JOB_CHANNEL
-    {"test_null_job", 0, 0, f_test_null_job},
+    {"test_null_job",	0, 0, f_test_null_job},
 #endif
-    {"test_null_list", 0, 0, f_test_null_list},
+    {"test_null_list",	0, 0, f_test_null_list},
     {"test_null_partial", 0, 0, f_test_null_partial},
     {"test_null_string", 0, 0, f_test_null_string},
+    {"test_settime",	1, 1, f_test_settime},
 #ifdef FEAT_TIMERS
     {"timer_start",	2, 3, f_timer_start},
     {"timer_stop",	1, 1, f_timer_stop},
@@ -10104,11 +10218,8 @@ f_bufnr(typval_T *argvars, typval_T *rettv)
 	rettv->vval.v_number = -1;
 }
 
-/*
- * "bufwinnr(nr)" function
- */
     static void
-f_bufwinnr(typval_T *argvars, typval_T *rettv)
+buf_win_common(typval_T *argvars, typval_T *rettv, int get_nr)
 {
 #ifdef FEAT_WINDOWS
     win_T	*wp;
@@ -10126,11 +10237,30 @@ f_bufwinnr(typval_T *argvars, typval_T *rettv)
 	if (wp->w_buffer == buf)
 	    break;
     }
-    rettv->vval.v_number = (wp != NULL ? winnr : -1);
+    rettv->vval.v_number = (wp != NULL ? (get_nr ? winnr : wp->w_id) : -1);
 #else
-    rettv->vval.v_number = (curwin->w_buffer == buf ? 1 : -1);
+    rettv->vval.v_number = (curwin->w_buffer == buf
+					  ? (get_nr ? 1 : curwin->w_id) : -1);
 #endif
     --emsg_off;
+}
+
+/*
+ * "bufwinid(nr)" function
+ */
+    static void
+f_bufwinid(typval_T *argvars, typval_T *rettv)
+{
+    buf_win_common(argvars, rettv, FALSE);
+}
+
+/*
+ * "bufwinnr(nr)" function
+ */
+    static void
+f_bufwinnr(typval_T *argvars, typval_T *rettv)
+{
+    buf_win_common(argvars, rettv, TRUE);
 }
 
 /*
@@ -12628,6 +12758,7 @@ f_getchar(typval_T *argvars, typval_T *rettv)
     --allow_keys;
 
     vimvars[VV_MOUSE_WIN].vv_nr = 0;
+    vimvars[VV_MOUSE_WINID].vv_nr = 0;
     vimvars[VV_MOUSE_LNUM].vv_nr = 0;
     vimvars[VV_MOUSE_COL].vv_nr = 0;
 
@@ -12683,6 +12814,7 @@ f_getchar(typval_T *argvars, typval_T *rettv)
 		    ++winnr;
 # endif
 		vimvars[VV_MOUSE_WIN].vv_nr = winnr;
+		vimvars[VV_MOUSE_WINID].vv_nr = win->w_id;
 		vimvars[VV_MOUSE_LNUM].vv_nr = lnum;
 		vimvars[VV_MOUSE_COL].vv_nr = col + 1;
 	    }
@@ -13436,11 +13568,18 @@ find_win_by_nr(
 
     for (wp = (tp == NULL || tp == curtab) ? firstwin : tp->tp_firstwin;
 						  wp != NULL; wp = wp->w_next)
-	if (--nr <= 0)
+	if (nr >= LOWEST_WIN_ID)
+	{
+	    if (wp->w_id == nr)
+		return wp;
+	}
+	else if (--nr <= 0)
 	    break;
+    if (nr >= LOWEST_WIN_ID)
+	return NULL;
     return wp;
 #else
-    if (nr == 0 || nr == 1)
+    if (nr == 0 || nr == 1 || nr == curwin->w_id)
 	return curwin;
     return NULL;
 #endif
@@ -15178,7 +15317,7 @@ f_join(typval_T *argvars, typval_T *rettv)
     if (sep != NULL)
     {
 	ga_init2(&ga, (int)sizeof(char), 80);
-	list_join(&ga, argvars[0].vval.v_list, sep, TRUE, 0);
+	list_join(&ga, argvars[0].vval.v_list, sep, TRUE, FALSE, 0);
 	ga_append(&ga, NUL);
 	rettv->vval.v_string = (char_u *)ga.ga_data;
     }
@@ -15735,6 +15874,7 @@ find_some_match(typval_T *argvars, typval_T *rettv, int type)
 		listitem_T *li3 = li2->li_next;
 		listitem_T *li4 = li3->li_next;
 
+		vim_free(li1->li_tv.vval.v_string);
 		li1->li_tv.vval.v_string = vim_strnsave(regmatch.startp[0],
 				(int)(regmatch.endp[0] - regmatch.startp[0]));
 		li3->li_tv.vval.v_number =
@@ -20711,7 +20851,7 @@ f_test_garbagecollect_now(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
 
 #ifdef FEAT_JOB_CHANNEL
     static void
-f_test_null_channel(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
+f_test_null_channel(typval_T *argvars UNUSED, typval_T *rettv)
 {
     rettv->v_type = VAR_CHANNEL;
     rettv->vval.v_channel = NULL;
@@ -20719,7 +20859,7 @@ f_test_null_channel(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
 #endif
 
     static void
-f_test_null_dict(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
+f_test_null_dict(typval_T *argvars UNUSED, typval_T *rettv)
 {
     rettv->v_type = VAR_DICT;
     rettv->vval.v_dict = NULL;
@@ -20727,7 +20867,7 @@ f_test_null_dict(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
 
 #ifdef FEAT_JOB_CHANNEL
     static void
-f_test_null_job(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
+f_test_null_job(typval_T *argvars UNUSED, typval_T *rettv)
 {
     rettv->v_type = VAR_JOB;
     rettv->vval.v_job = NULL;
@@ -20735,24 +20875,30 @@ f_test_null_job(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
 #endif
 
     static void
-f_test_null_list(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
+f_test_null_list(typval_T *argvars UNUSED, typval_T *rettv)
 {
     rettv->v_type = VAR_LIST;
     rettv->vval.v_list = NULL;
 }
 
     static void
-f_test_null_partial(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
+f_test_null_partial(typval_T *argvars UNUSED, typval_T *rettv)
 {
     rettv->v_type = VAR_PARTIAL;
     rettv->vval.v_partial = NULL;
 }
 
     static void
-f_test_null_string(typval_T *argvars UNUSED, typval_T *rettv UNUSED)
+f_test_null_string(typval_T *argvars UNUSED, typval_T *rettv)
 {
     rettv->v_type = VAR_STRING;
     rettv->vval.v_string = NULL;
+}
+
+    static void
+f_test_settime(typval_T *argvars, typval_T *rettv UNUSED)
+{
+    time_for_testing = (time_t)get_tv_number(&argvars[0]);
 }
 
 #if defined(FEAT_JOB_CHANNEL) || defined(FEAT_TIMERS) || defined(PROTO)
@@ -25310,7 +25456,12 @@ func_unref(char_u *name)
     {
 	fp = find_func(name);
 	if (fp == NULL)
-	    EMSG2(_(e_intern2), "func_unref()");
+	{
+#ifdef EXITFREE
+	    if (!entered_free_all_mem)
+#endif
+		EMSG2(_(e_intern2), "func_unref()");
+	}
 	else if (--fp->uf_refcount <= 0)
 	{
 	    /* Only delete it when it's not being used.  Otherwise it's done
