@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -57,6 +57,7 @@ setmark(int c)
 setmark_pos(int c, pos_T *pos, int fnum)
 {
     int		i;
+    buf_T	*buf;
 
     /* Check for a special key (may cause islower() to crash). */
     if (c < 0)
@@ -75,9 +76,13 @@ setmark_pos(int c, pos_T *pos, int fnum)
 	return OK;
     }
 
+    buf = buflist_findnr(fnum);
+    if (buf == NULL)
+	return FAIL;
+
     if (c == '"')
     {
-	curbuf->b_last_cursor = *pos;
+	buf->b_last_cursor = *pos;
 	return OK;
     }
 
@@ -85,31 +90,31 @@ setmark_pos(int c, pos_T *pos, int fnum)
      * file. */
     if (c == '[')
     {
-	curbuf->b_op_start = *pos;
+	buf->b_op_start = *pos;
 	return OK;
     }
     if (c == ']')
     {
-	curbuf->b_op_end = *pos;
+	buf->b_op_end = *pos;
 	return OK;
     }
 
     if (c == '<' || c == '>')
     {
 	if (c == '<')
-	    curbuf->b_visual.vi_start = *pos;
+	    buf->b_visual.vi_start = *pos;
 	else
-	    curbuf->b_visual.vi_end = *pos;
-	if (curbuf->b_visual.vi_mode == NUL)
+	    buf->b_visual.vi_end = *pos;
+	if (buf->b_visual.vi_mode == NUL)
 	    /* Visual_mode has not yet been set, use a sane default. */
-	    curbuf->b_visual.vi_mode = 'v';
+	    buf->b_visual.vi_mode = 'v';
 	return OK;
     }
 
     if (ASCII_ISLOWER(c))
     {
 	i = c - 'a';
-	curbuf->b_namedm[i] = *pos;
+	buf->b_namedm[i] = *pos;
 	return OK;
     }
     if (ASCII_ISUPPER(c) || VIM_ISDIGIT(c))
@@ -396,7 +401,8 @@ getmark_buf_fnum(
     {
 	startp = &buf->b_visual.vi_start;
 	endp = &buf->b_visual.vi_end;
-	if ((c == '<') == lt(*startp, *endp))
+	if (((c == '<') == lt(*startp, *endp) || endp->lnum == 0)
+							  && startp->lnum != 0)
 	    posp = startp;
 	else
 	    posp = endp;
@@ -1597,7 +1603,8 @@ handle_viminfo_mark(garray_T *values, int force)
 
     if (fm != NULL)
     {
-	if (vi_namedfm != NULL || fm->time_set < timestamp || force)
+	if (vi_namedfm != NULL || fm->fmark.mark.lnum == 0
+					  || fm->time_set < timestamp || force)
 	{
 	    fm->fmark.mark.lnum = lnum;
 	    fm->fmark.mark.col = col;
@@ -1799,16 +1806,54 @@ removable(char_u *name)
     return retval;
 }
 
-static void write_one_mark(FILE *fp_out, int c, pos_T *pos);
+    static void
+write_one_mark(FILE *fp_out, int c, pos_T *pos)
+{
+    if (pos->lnum != 0)
+	fprintf(fp_out, "\t%c\t%ld\t%d\n", c, (long)pos->lnum, (int)pos->col);
+}
+
+
+    static void
+write_buffer_marks(buf_T *buf, FILE *fp_out)
+{
+    int		i;
+    pos_T	pos;
+
+    home_replace(NULL, buf->b_ffname, IObuff, IOSIZE, TRUE);
+    fprintf(fp_out, "\n> ");
+    viminfo_writestring(fp_out, IObuff);
+
+    /* Write the last used timestamp as the lnum of the non-existing mark '*'.
+     * Older Vims will ignore it and/or copy it. */
+    pos.lnum = (linenr_T)buf->b_last_used;
+    pos.col = 0;
+    write_one_mark(fp_out, '*', &pos);
+
+    write_one_mark(fp_out, '"', &buf->b_last_cursor);
+    write_one_mark(fp_out, '^', &buf->b_last_insert);
+    write_one_mark(fp_out, '.', &buf->b_last_change);
+#ifdef FEAT_JUMPLIST
+    /* changelist positions are stored oldest first */
+    for (i = 0; i < buf->b_changelistlen; ++i)
+    {
+	/* skip duplicates */
+	if (i == 0 || !equalpos(buf->b_changelist[i - 1], buf->b_changelist[i]))
+	    write_one_mark(fp_out, '+', &buf->b_changelist[i]);
+    }
+#endif
+    for (i = 0; i < NMARKS; i++)
+	write_one_mark(fp_out, 'a' + i, &buf->b_namedm[i]);
+}
 
 /*
  * Write all the named marks for all buffers.
- * Return the number of buffers for which marks have been written.
+ * When "buflist" is not NULL fill it with the buffers for which marks are to
+ * be written.
  */
-    int
-write_viminfo_marks(FILE *fp_out)
+    void
+write_viminfo_marks(FILE *fp_out, garray_T *buflist)
 {
-    int		count;
     buf_T	*buf;
     int		is_mark_set;
     int		i;
@@ -1826,8 +1871,7 @@ write_viminfo_marks(FILE *fp_out)
 #endif
 
     fputs(_("\n# History of marks within files (newest to oldest):\n"), fp_out);
-    count = 0;
-    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+    FOR_ALL_BUFFERS(buf)
     {
 	/*
 	 * Only write something if buffer has been loaded and at least one
@@ -1850,37 +1894,35 @@ write_viminfo_marks(FILE *fp_out)
 	    if (is_mark_set && buf->b_ffname != NULL
 		      && buf->b_ffname[0] != NUL && !removable(buf->b_ffname))
 	    {
-		home_replace(NULL, buf->b_ffname, IObuff, IOSIZE, TRUE);
-		fprintf(fp_out, "\n> ");
-		viminfo_writestring(fp_out, IObuff);
-		write_one_mark(fp_out, '"', &buf->b_last_cursor);
-		write_one_mark(fp_out, '^', &buf->b_last_insert);
-		write_one_mark(fp_out, '.', &buf->b_last_change);
-#ifdef FEAT_JUMPLIST
-		/* changelist positions are stored oldest first */
-		for (i = 0; i < buf->b_changelistlen; ++i)
-		    write_one_mark(fp_out, '+', &buf->b_changelist[i]);
-#endif
-		for (i = 0; i < NMARKS; i++)
-		    write_one_mark(fp_out, 'a' + i, &buf->b_namedm[i]);
-		count++;
+		if (buflist == NULL)
+		    write_buffer_marks(buf, fp_out);
+		else if (ga_grow(buflist, 1) == OK)
+		    ((buf_T **)buflist->ga_data)[buflist->ga_len++] = buf;
 	    }
 	}
     }
-
-    return count;
 }
 
-    static void
-write_one_mark(FILE *fp_out, int c, pos_T *pos)
+/*
+ * Compare functions for qsort() below, that compares b_last_used.
+ */
+    static int
+#ifdef __BORLANDC__
+_RTLENTRYF
+#endif
+buf_compare(const void *s1, const void *s2)
 {
-    if (pos->lnum != 0)
-	fprintf(fp_out, "\t%c\t%ld\t%d\n", c, (long)pos->lnum, (int)pos->col);
+    buf_T *buf1 = *(buf_T **)s1;
+    buf_T *buf2 = *(buf_T **)s2;
+
+    if (buf1->b_last_used == buf2->b_last_used)
+	return 0;
+    return buf1->b_last_used > buf2->b_last_used ? -1 : 1;
 }
 
 /*
  * Handle marks in the viminfo file:
- * fp_out != NULL: copy marks for buffers not in buffer list
+ * fp_out != NULL: copy marks, in time order with buffers in "buflist".
  * fp_out == NULL && (flags & VIF_WANT_MARKS): read marks for curbuf only
  * fp_out == NULL && (flags & VIF_GET_OLDFILES | VIF_FORCEIT): fill v:oldfiles
  */
@@ -1888,7 +1930,7 @@ write_one_mark(FILE *fp_out, int c, pos_T *pos)
 copy_viminfo_marks(
     vir_T	*virp,
     FILE	*fp_out,
-    int		count,
+    garray_T	*buflist,
     int		eof,
     int		flags)
 {
@@ -1905,10 +1947,21 @@ copy_viminfo_marks(
 #ifdef FEAT_EVAL
     list_T	*list = NULL;
 #endif
+    int		count = 0;
+    int		buflist_used = 0;
+    buf_T	*buflist_buf = NULL;
 
     if ((name_buf = alloc(LSIZE)) == NULL)
 	return;
     *name_buf = NUL;
+
+    if (fp_out != NULL && buflist->ga_len > 0)
+    {
+	/* Sort the list of buffers on b_last_used. */
+	qsort(buflist->ga_data, (size_t)buflist->ga_len,
+						sizeof(buf_T *), buf_compare);
+	buflist_buf = ((buf_T **)buflist->ga_data)[0];
+    }
 
 #ifdef FEAT_EVAL
     if (fp_out == NULL && (flags & (VIF_GET_OLDFILES | VIF_FORCEIT)))
@@ -1972,7 +2025,7 @@ copy_viminfo_marks(
 	else /* fp_out != NULL */
 	{
 	    /* This is slow if there are many buffers!! */
-	    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+	    FOR_ALL_BUFFERS(buf)
 		if (buf->b_ffname != NULL)
 		{
 		    home_replace(NULL, buf->b_ffname, name_buf, LSIZE, TRUE);
@@ -1981,14 +2034,70 @@ copy_viminfo_marks(
 		}
 
 	    /*
-	     * copy marks if the buffer has not been loaded
+	     * Copy marks if the buffer has not been loaded.
 	     */
 	    if (buf == NULL || !buf->b_marks_read)
 	    {
-		copy_marks_out = TRUE;
+		int	did_read_line = FALSE;
+
+		if (buflist_buf != NULL)
+		{
+		    /* Read the next line.  If it has the "*" mark compare the
+		     * time stamps.  Write entries from "buflist" that are
+		     * newer. */
+		    if (!(eof = viminfo_readline(virp)) && line[0] == TAB)
+		    {
+			did_read_line = TRUE;
+			if (line[1] == '*')
+			{
+			    long	ltime;
+
+			    sscanf((char *)line + 2, "%ld ", &ltime);
+			    while ((time_T)ltime < buflist_buf->b_last_used)
+			    {
+				write_buffer_marks(buflist_buf, fp_out);
+				if (++count >= num_marked_files)
+				    break;
+				if (++buflist_used == buflist->ga_len)
+				{
+				    buflist_buf = NULL;
+				    break;
+				}
+				buflist_buf =
+				   ((buf_T **)buflist->ga_data)[buflist_used];
+			    }
+			}
+			else
+			{
+			    /* No timestamp, must be written by an older Vim.
+			     * Assume all remaining buffers are older then
+			     * ours.  */
+			    while (count < num_marked_files
+					    && buflist_used < buflist->ga_len)
+			    {
+				buflist_buf = ((buf_T **)buflist->ga_data)
+							     [buflist_used++];
+				write_buffer_marks(buflist_buf, fp_out);
+				++count;
+			    }
+			    buflist_buf = NULL;
+			}
+
+			if (count >= num_marked_files)
+			{
+			    vim_free(str);
+			    break;
+			}
+		    }
+		}
+
 		fputs("\n> ", fp_out);
 		viminfo_writestring(fp_out, str);
+		if (did_read_line)
+		    fputs((char *)line, fp_out);
+
 		count++;
+		copy_marks_out = TRUE;
 	    }
 	}
 	vim_free(str);
@@ -2026,6 +2135,11 @@ copy_viminfo_marks(
 					   curbuf->b_changelistlen - 1] = pos;
 #endif
 				  break;
+
+				  /* Using the line number for the last-used
+				   * timestamp. */
+			case '*': curbuf->b_last_used = pos.lnum; break;
+
 			default:  if ((i = line[1] - 'a') >= 0 && i < NMARKS)
 				      curbuf->b_namedm[i] = pos;
 		    }
@@ -2034,6 +2148,7 @@ copy_viminfo_marks(
 	    else if (copy_marks_out)
 		fputs((char *)line, fp_out);
 	}
+
 	if (load_marks)
 	{
 #ifdef FEAT_JUMPLIST
@@ -2048,6 +2163,16 @@ copy_viminfo_marks(
 	    break;
 	}
     }
+
+    if (fp_out != NULL)
+	/* Write any remaining entries from buflist. */
+	while (count < num_marked_files && buflist_used < buflist->ga_len)
+	{
+	    buflist_buf = ((buf_T **)buflist->ga_data)[buflist_used++];
+	    write_buffer_marks(buflist_buf, fp_out);
+	    ++count;
+	}
+
     vim_free(name_buf);
 }
 #endif /* FEAT_VIMINFO */

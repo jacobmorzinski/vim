@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -259,11 +259,6 @@ op_shift(oparg_T *oap, int curs_top, int amount)
     }
 
     changed_lines(oap->start.lnum, 0, oap->end.lnum + 1, 0L);
-#ifdef FEAT_FOLDING
-    /* The cursor line is not in a closed fold */
-    foldOpenCursor();
-#endif
-
     if (oap->block_mode)
     {
 	curwin->w_cursor.lnum = oap->start.lnum;
@@ -276,6 +271,12 @@ op_shift(oparg_T *oap, int curs_top, int amount)
     }
     else
 	--curwin->w_cursor.lnum;	/* put cursor on last line, for ":>" */
+
+#ifdef FEAT_FOLDING
+    /* The cursor line is not in a closed fold */
+    foldOpenCursor();
+#endif
+
 
     if (oap->line_count > p_report)
     {
@@ -1179,9 +1180,9 @@ stuff_yank(int regname, char_u *p)
 static int execreg_lastc = NUL;
 
 /*
- * execute a yank register: copy it into the stuff buffer
+ * Execute a yank register: copy it into the stuff buffer.
  *
- * return FAIL for failure, OK otherwise
+ * Return FAIL for failure, OK otherwise.
  */
     int
 do_execreg(
@@ -1627,6 +1628,22 @@ adjust_clip_reg(int *rp)
 #endif
 
 /*
+ * Shift the delete registers: "9 is cleared, "8 becomes "9, etc.
+ */
+    void
+shift_delete_registers()
+{
+    int		n;
+
+    y_current = &y_regs[9];
+    free_yank_all();			/* free register nine */
+    for (n = 9; n > 1; --n)
+	y_regs[n] = y_regs[n - 1];
+    y_previous = y_current = &y_regs[1];
+    y_regs[1].y_array = NULL;		/* set register one to empty */
+}
+
+/*
  * Handle a delete operation.
  *
  * Return FAIL if undo failed, OK otherwise.
@@ -1738,12 +1755,7 @@ op_delete(oparg_T *oap)
 	if (orig_regname != 0 || oap->motion_type == MLINE
 				   || oap->line_count > 1 || oap->use_reg_one)
 	{
-	    y_current = &y_regs[9];
-	    free_yank_all();			/* free register nine */
-	    for (n = 9; n > 1; --n)
-		y_regs[n] = y_regs[n - 1];
-	    y_previous = y_current = &y_regs[1];
-	    y_regs[1].y_array = NULL;		/* set register one to empty */
+	    shift_delete_registers();
 	    if (op_yank(oap, TRUE, FALSE) == OK)
 		did_yank = TRUE;
 	}
@@ -2570,7 +2582,7 @@ op_insert(oparg_T *oap, long count1)
     }
 
     t1 = oap->start;
-    edit(NUL, FALSE, (linenr_T)count1);
+    (void)edit(NUL, FALSE, (linenr_T)count1);
 
     /* When a tab was inserted, and the characters in front of the tab
      * have been converted to a tab as well, the column of the cursor
@@ -3350,6 +3362,8 @@ do_put(
      */
     if (regname == '.')
     {
+	if (VIsual_active)
+	    stuffcharReadbuff(VIsual_mode);
 	(void)stuff_inserted((dir == FORWARD ? (count == -1 ? 'o' : 'a') :
 				    (count == -1 ? 'O' : 'i')), count, FALSE);
 	/* Putting the text is done later, so can't really move the cursor to
@@ -3547,7 +3561,7 @@ do_put(
      */
     if (y_type == MBLOCK)
     {
-	char	c = gchar_cursor();
+	int	c = gchar_cursor();
 	colnr_T	endcol2 = 0;
 
 	if (dir == FORWARD && c != NUL)
@@ -3771,11 +3785,25 @@ do_put(
 	 */
 	if (y_type == MCHAR && y_size == 1)
 	{
+	    linenr_T end_lnum = 0; /* init for gcc */
+
+	    if (VIsual_active)
+	    {
+		end_lnum = curbuf->b_visual.vi_end.lnum;
+		if (end_lnum < curbuf->b_visual.vi_start.lnum)
+		    end_lnum = curbuf->b_visual.vi_start.lnum;
+	    }
+
 	    do {
 		totlen = count * yanklen;
 		if (totlen > 0)
 		{
 		    oldp = ml_get(lnum);
+		    if (VIsual_active && col > (int)STRLEN(oldp))
+		    {
+			lnum++;
+			continue;
+		    }
 		    newp = alloc_check((unsigned)(STRLEN(oldp) + totlen + 1));
 		    if (newp == NULL)
 			goto end;	/* alloc() gave an error message */
@@ -3798,7 +3826,7 @@ do_put(
 		}
 		if (VIsual_active)
 		    lnum++;
-	    } while (VIsual_active && lnum <= curbuf->b_visual.vi_end.lnum);
+	    } while (VIsual_active && lnum <= end_lnum);
 
 	    if (VIsual_active) /* reset lnum to the last visual line */
 		lnum--;
@@ -4741,6 +4769,7 @@ fex_format(
     int		use_sandbox = was_set_insecurely((char_u *)"formatexpr",
 								   OPT_LOCAL);
     int		r;
+    char_u	*fex;
 
     /*
      * Set v:lnum to the first line number and v:count to the number of lines.
@@ -4750,16 +4779,22 @@ fex_format(
     set_vim_var_nr(VV_COUNT, count);
     set_vim_var_char(c);
 
+    /* Make a copy, the option could be changed while calling it. */
+    fex = vim_strsave(curbuf->b_p_fex);
+    if (fex == NULL)
+	return 0;
+
     /*
      * Evaluate the function.
      */
     if (use_sandbox)
 	++sandbox;
-    r = eval_to_number(curbuf->b_p_fex);
+    r = (int)eval_to_number(fex);
     if (use_sandbox)
 	--sandbox;
 
     set_vim_var_string(VV_CHAR, NULL, -1);
+    vim_free(fex);
 
     return r;
 }
@@ -5449,8 +5484,8 @@ do_addsub(
     char_u	buf2[NUMBUFLEN];
     int		pre;		/* 'X'/'x': hex; '0': octal; 'B'/'b': bin */
     static int	hexupper = FALSE;	/* 0xABC */
-    unsigned long n;
-    long_u	oldn;
+    uvarnumber_T	n;
+    uvarnumber_T	oldn;
     char_u	*ptr;
     int		c;
     int		todel;
@@ -5708,9 +5743,9 @@ do_addsub(
 
 	oldn = n;
 	if (subtract)
-	    n -= (unsigned long)Prenum1;
+	    n -= (uvarnumber_T)Prenum1;
 	else
-	    n += (unsigned long)Prenum1;
+	    n += (uvarnumber_T)Prenum1;
 	/* handle wraparound for decimal numbers */
 	if (!pre)
 	{
@@ -5718,7 +5753,7 @@ do_addsub(
 	    {
 		if (n > oldn)
 		{
-		    n = 1 + (n ^ (unsigned long)-1);
+		    n = 1 + (n ^ (uvarnumber_T)-1);
 		    negative ^= TRUE;
 		}
 	    }
@@ -5727,7 +5762,7 @@ do_addsub(
 		/* add */
 		if (n < oldn)
 		{
-		    n = (n ^ (unsigned long)-1);
+		    n = (n ^ (uvarnumber_T)-1);
 		    negative ^= TRUE;
 		}
 	    }
@@ -5803,7 +5838,7 @@ do_addsub(
 	{
 	    int i;
 	    int bit = 0;
-	    int bits = sizeof(unsigned long) * 8;
+	    int bits = sizeof(uvarnumber_T) * 8;
 
 	    /* leading zeros */
 	    for (bit = bits; bit > 0; bit--)
@@ -5815,13 +5850,13 @@ do_addsub(
 	    buf2[i] = '\0';
 	}
 	else if (pre == 0)
-	    sprintf((char *)buf2, "%lu", n);
+	    vim_snprintf((char *)buf2, NUMBUFLEN, "%llu", n);
 	else if (pre == '0')
-	    sprintf((char *)buf2, "%lo", n);
+	    vim_snprintf((char *)buf2, NUMBUFLEN, "%llo", n);
 	else if (pre && hexupper)
-	    sprintf((char *)buf2, "%lX", n);
+	    vim_snprintf((char *)buf2, NUMBUFLEN, "%llX", n);
 	else
-	    sprintf((char *)buf2, "%lx", n);
+	    vim_snprintf((char *)buf2, NUMBUFLEN, "%llx", n);
 	length -= (int)STRLEN(buf2);
 
 	/*
@@ -6283,7 +6318,7 @@ write_viminfo_registers(FILE *fp)
  * 'permanent' of the two), otherwise the PRIMARY one.
  * For now, use a hard-coded sanity limit of 1Mb of data.
  */
-#if defined(FEAT_X11) && defined(FEAT_CLIPBOARD)
+#if (defined(FEAT_X11) && defined(FEAT_CLIPBOARD)) || defined(PROTO)
     void
 x11_export_final_selection(void)
 {
@@ -7086,7 +7121,7 @@ clear_oparg(oparg_T *oap)
     vim_memset(oap, 0, sizeof(oparg_T));
 }
 
-static long	line_count_info(char_u *line, long *wc, long *cc, long limit, int eol_size);
+static varnumber_T line_count_info(char_u *line, varnumber_T *wc, varnumber_T *cc, varnumber_T limit, int eol_size);
 
 /*
  *  Count the number of bytes, characters and "words" in a line.
@@ -7102,17 +7137,17 @@ static long	line_count_info(char_u *line, long *wc, long *cc, long limit, int eo
  *  case, eol_size will be added to the character count to account for
  *  the size of the EOL character.
  */
-    static long
+    static varnumber_T
 line_count_info(
     char_u	*line,
-    long	*wc,
-    long	*cc,
-    long	limit,
+    varnumber_T	*wc,
+    varnumber_T	*cc,
+    varnumber_T	limit,
     int		eol_size)
 {
-    long	i;
-    long	words = 0;
-    long	chars = 0;
+    varnumber_T	i;
+    varnumber_T	words = 0;
+    varnumber_T	chars = 0;
     int		is_word = 0;
 
     for (i = 0; i < limit && line[i] != NUL; )
@@ -7162,17 +7197,17 @@ cursor_pos_info(dict_T *dict)
     char_u	buf1[50];
     char_u	buf2[40];
     linenr_T	lnum;
-    long	byte_count = 0;
+    varnumber_T	byte_count = 0;
 #ifdef FEAT_MBYTE
-    long	bom_count  = 0;
+    varnumber_T	bom_count  = 0;
 #endif
-    long	byte_count_cursor = 0;
-    long	char_count = 0;
-    long	char_count_cursor = 0;
-    long	word_count = 0;
-    long	word_count_cursor = 0;
+    varnumber_T	byte_count_cursor = 0;
+    varnumber_T	char_count = 0;
+    varnumber_T	char_count_cursor = 0;
+    varnumber_T	word_count = 0;
+    varnumber_T	word_count_cursor = 0;
     int		eol_size;
-    long	last_check = 100000L;
+    varnumber_T	last_check = 100000L;
     long	line_count_selected = 0;
     pos_T	min_pos, max_pos;
     oparg_T	oparg;
@@ -7308,12 +7343,14 @@ cursor_pos_info(dict_T *dict)
 		    byte_count_cursor = byte_count +
 			line_count_info(ml_get(lnum),
 				&word_count_cursor, &char_count_cursor,
-				  (long)(curwin->w_cursor.col + 1), eol_size);
+				(varnumber_T)(curwin->w_cursor.col + 1),
+				eol_size);
 		}
 	    }
 	    /* Add to the running totals */
 	    byte_count += line_count_info(ml_get(lnum), &word_count,
-					 &char_count, (long)MAXCOL, eol_size);
+					 &char_count, (varnumber_T)MAXCOL,
+					 eol_size);
 	}
 
 	/* Correction for when last line doesn't have an EOL. */
@@ -7337,14 +7374,14 @@ cursor_pos_info(dict_T *dict)
 		if (char_count_cursor == byte_count_cursor
 						    && char_count == byte_count)
 		    vim_snprintf((char *)IObuff, IOSIZE,
-			    _("Selected %s%ld of %ld Lines; %ld of %ld Words; %ld of %ld Bytes"),
+			    _("Selected %s%ld of %ld Lines; %lld of %lld Words; %lld of %lld Bytes"),
 			    buf1, line_count_selected,
 			    (long)curbuf->b_ml.ml_line_count,
 			    word_count_cursor, word_count,
 			    byte_count_cursor, byte_count);
 		else
 		    vim_snprintf((char *)IObuff, IOSIZE,
-			    _("Selected %s%ld of %ld Lines; %ld of %ld Words; %ld of %ld Chars; %ld of %ld Bytes"),
+			    _("Selected %s%ld of %ld Lines; %lld of %lld Words; %lld of %lld Chars; %lld of %lld Bytes"),
 			    buf1, line_count_selected,
 			    (long)curbuf->b_ml.ml_line_count,
 			    word_count_cursor, word_count,
@@ -7363,7 +7400,7 @@ cursor_pos_info(dict_T *dict)
 		if (char_count_cursor == byte_count_cursor
 			&& char_count == byte_count)
 		    vim_snprintf((char *)IObuff, IOSIZE,
-			_("Col %s of %s; Line %ld of %ld; Word %ld of %ld; Byte %ld of %ld"),
+			_("Col %s of %s; Line %ld of %ld; Word %lld of %lld; Byte %lld of %lld"),
 			(char *)buf1, (char *)buf2,
 			(long)curwin->w_cursor.lnum,
 			(long)curbuf->b_ml.ml_line_count,
@@ -7371,7 +7408,7 @@ cursor_pos_info(dict_T *dict)
 			byte_count_cursor, byte_count);
 		else
 		    vim_snprintf((char *)IObuff, IOSIZE,
-			_("Col %s of %s; Line %ld of %ld; Word %ld of %ld; Char %ld of %ld; Byte %ld of %ld"),
+			_("Col %s of %s; Line %ld of %ld; Word %lld of %lld; Char %lld of %lld; Byte %lld of %lld"),
 			(char *)buf1, (char *)buf2,
 			(long)curwin->w_cursor.lnum,
 			(long)curbuf->b_ml.ml_line_count,
@@ -7399,19 +7436,19 @@ cursor_pos_info(dict_T *dict)
 #if defined(FEAT_EVAL)
     if (dict != NULL)
     {
-	dict_add_nr_str(dict, "words", (long)word_count, NULL);
-	dict_add_nr_str(dict, "chars", (long)char_count, NULL);
-	dict_add_nr_str(dict, "bytes", (long)byte_count
+	dict_add_nr_str(dict, "words", word_count, NULL);
+	dict_add_nr_str(dict, "chars", char_count, NULL);
+	dict_add_nr_str(dict, "bytes", byte_count
 # ifdef FEAT_MBYTE
 		+ bom_count
 # endif
 		, NULL);
 	dict_add_nr_str(dict, VIsual_active ? "visual_bytes" : "cursor_bytes",
-		(long)byte_count_cursor, NULL);
+		byte_count_cursor, NULL);
 	dict_add_nr_str(dict, VIsual_active ? "visual_chars" : "cursor_chars",
-		(long)char_count_cursor, NULL);
+		char_count_cursor, NULL);
 	dict_add_nr_str(dict, VIsual_active ? "visual_words" : "cursor_words",
-		(long)word_count_cursor, NULL);
+		word_count_cursor, NULL);
     }
 #endif
 }

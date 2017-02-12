@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -38,13 +38,9 @@
 
 # if defined(FEAT_PRINTER) && !defined(FEAT_POSTSCRIPT)
 #  include <dlgs.h>
-#  ifdef WIN3264
-#   include <winspool.h>
-#  else
-#   include <print.h>
-#  endif
+#  include <winspool.h>
 #  include <commdlg.h>
-#endif
+# endif
 
 #endif /* PROTO */
 
@@ -130,10 +126,6 @@ typedef void VOID;
 FILE* fdDump = NULL;
 #endif
 
-#ifdef WIN3264
-extern DWORD g_PlatformId;
-#endif
-
 #ifndef FEAT_GUI_MSWIN
 extern char g_szOrigTitle[];
 #endif
@@ -209,6 +201,8 @@ int _stricoll(char *a, char *b)
     void
 mch_exit(int r)
 {
+    exiting = TRUE;
+
     display_errors();
 
     ml_close_all(TRUE);		/* remove all memfiles */
@@ -248,20 +242,13 @@ mch_early_init(void)
 {
     int		i;
 
-#ifdef WIN3264
     PlatformId();
-#endif
 
     /* Init the tables for toupper() and tolower() */
     for (i = 0; i < 256; ++i)
 	toupper_tab[i] = tolower_tab[i] = i;
-#ifdef WIN3264
     CharUpperBuff((LPSTR)toupper_tab, 256);
     CharLowerBuff((LPSTR)tolower_tab, 256);
-#else
-    AnsiUpperBuff((LPSTR)toupper_tab, 256);
-    AnsiLowerBuff((LPSTR)tolower_tab, 256);
-#endif
 }
 
 
@@ -299,14 +286,12 @@ mch_settitle(
 	{
 	    /* Convert the title from 'encoding' to the active codepage. */
 	    WCHAR	*wp = enc_to_utf16(title, NULL);
-	    int	n;
 
 	    if (wp != NULL)
 	    {
-		n = SetConsoleTitleW(wp);
+		SetConsoleTitleW(wp);
 		vim_free(wp);
-		if (n != 0 || GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-		    return;
+		return;
 	    }
 	}
 #  endif
@@ -323,10 +308,8 @@ mch_settitle(
  *  2: Just restore icon (which we don't have)
  *  3: Restore title and icon (which we don't have)
  */
-/*ARGSUSED*/
     void
-mch_restore_title(
-    int which)
+mch_restore_title(int which UNUSED)
 {
 #ifndef FEAT_GUI_MSWIN
     SetConsoleTitle(g_szOrigTitle);
@@ -362,13 +345,12 @@ mch_can_restore_icon(void)
  * When 'shellslash' set do it the other way around.
  * Return OK or FAIL.
  */
-/*ARGSUSED*/
     int
 mch_FullName(
     char_u	*fname,
     char_u	*buf,
     int		len,
-    int		force)
+    int		force UNUSED)
 {
     int		nResult = FAIL;
 
@@ -379,12 +361,7 @@ mch_FullName(
 #endif
     {
 #ifdef FEAT_MBYTE
-	if (enc_codepage >= 0 && (int)GetACP() != enc_codepage
-# ifdef __BORLANDC__
-		/* Wide functions of Borland C 5.5 do not work on Windows 98. */
-		&& g_PlatformId == VER_PLATFORM_WIN32_NT
-# endif
-	   )
+	if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
 	{
 	    WCHAR	*wname;
 	    WCHAR	wbuf[MAX_PATH];
@@ -481,6 +458,18 @@ slash_adjust(char_u *p)
     }
 }
 
+/* Use 64-bit stat functions if available. */
+#ifdef HAVE_STAT64
+# undef stat
+# undef _stat
+# undef _wstat
+# undef _fstat
+# define stat _stat64
+# define _stat _stat64
+# define _wstat _wstat64
+# define _fstat _fstat64
+#endif
+
 #if (defined(_MSC_VER) && (_MSC_VER >= 1300)) || defined(__MINGW32__)
 # define OPEN_OH_ARGTYPE intptr_t
 #else
@@ -488,7 +477,7 @@ slash_adjust(char_u *p)
 #endif
 
     static int
-stat_symlink_aware(const char *name, struct stat *stp)
+stat_symlink_aware(const char *name, stat_T *stp)
 {
 #if (defined(_MSC_VER) && (_MSC_VER < 1900)) || defined(__MINGW32__)
     /* Work around for VC12 or earlier (and MinGW). stat() can't handle
@@ -527,7 +516,7 @@ stat_symlink_aware(const char *name, struct stat *stp)
 	    int	    fd, n;
 
 	    fd = _open_osfhandle((OPEN_OH_ARGTYPE)h, _O_RDONLY);
-	    n = _fstat(fd, (struct _stat*)stp);
+	    n = _fstat(fd, (struct _stat *)stp);
 	    if ((n == 0) && (attr & FILE_ATTRIBUTE_DIRECTORY))
 		stp->st_mode = (stp->st_mode & ~S_IFREG) | S_IFDIR;
 	    _close(fd);
@@ -540,7 +529,7 @@ stat_symlink_aware(const char *name, struct stat *stp)
 
 #ifdef FEAT_MBYTE
     static int
-wstat_symlink_aware(const WCHAR *name, struct _stat *stp)
+wstat_symlink_aware(const WCHAR *name, stat_T *stp)
 {
 # if (defined(_MSC_VER) && (_MSC_VER < 1900)) || defined(__MINGW32__)
     /* Work around for VC12 or earlier (and MinGW). _wstat() can't handle
@@ -580,7 +569,7 @@ wstat_symlink_aware(const WCHAR *name, struct _stat *stp)
 	    int	    fd;
 
 	    fd = _open_osfhandle((OPEN_OH_ARGTYPE)h, _O_RDONLY);
-	    n = _fstat(fd, stp);
+	    n = _fstat(fd, (struct _stat *)stp);
 	    if ((n == 0) && (attr & FILE_ATTRIBUTE_DIRECTORY))
 		stp->st_mode = (stp->st_mode & ~S_IFREG) | S_IFDIR;
 	    _close(fd);
@@ -588,7 +577,7 @@ wstat_symlink_aware(const WCHAR *name, struct _stat *stp)
 	}
     }
 # endif
-    return _wstat(name, stp);
+    return _wstat(name, (struct _stat *)stp);
 }
 #endif
 
@@ -596,7 +585,7 @@ wstat_symlink_aware(const WCHAR *name, struct _stat *stp)
  * stat() can't handle a trailing '/' or '\', remove it first.
  */
     int
-vim_stat(const char *name, struct stat *stp)
+vim_stat(const char *name, stat_T *stp)
 {
 #ifdef FEAT_MBYTE
     /* WinNT and later can use _MAX_PATH wide characters for a pathname, which
@@ -629,25 +618,16 @@ vim_stat(const char *name, struct stat *stp)
 	}
     }
 #ifdef FEAT_MBYTE
-    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage
-# ifdef __BORLANDC__
-	    /* Wide functions of Borland C 5.5 do not work on Windows 98. */
-	    && g_PlatformId == VER_PLATFORM_WIN32_NT
-# endif
-       )
+    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
     {
 	WCHAR	*wp = enc_to_utf16(buf, NULL);
 	int	n;
 
 	if (wp != NULL)
 	{
-	    n = wstat_symlink_aware(wp, (struct _stat *)stp);
+	    n = wstat_symlink_aware(wp, stp);
 	    vim_free(wp);
-	    if (n >= 0 || g_PlatformId == VER_PLATFORM_WIN32_NT)
-		return n;
-	    /* Retry with non-wide function (for Windows 98). Can't use
-	     * GetLastError() here and it's unclear what errno gets set to if
-	     * the _wstat() fails for missing wide functions. */
+	    return n;
 	}
     }
 #endif
@@ -655,9 +635,8 @@ vim_stat(const char *name, struct stat *stp)
 }
 
 #if defined(FEAT_GUI_MSWIN) || defined(PROTO)
-/*ARGSUSED*/
     void
-mch_settmode(int tmode)
+mch_settmode(int tmode UNUSED)
 {
     /* nothing to do */
 }
@@ -811,9 +790,7 @@ mch_chdir(char *path)
 	{
 	    n = _wchdir(p);
 	    vim_free(p);
-	    if (n == 0 || g_PlatformId == VER_PLATFORM_WIN32_NT)
-		return n;
-	    /* Retry with non-wide function (for Windows 98). */
+	    return n;
 	}
     }
 #endif
@@ -821,27 +798,6 @@ mch_chdir(char *path)
     return chdir(path);	       /* let the normal chdir() do the rest */
 }
 
-
-/*
- * Switching off termcap mode is only allowed when Columns is 80, otherwise a
- * crash may result.  It's always allowed on NT or when running the GUI.
- */
-/*ARGSUSED*/
-    int
-can_end_termcap_mode(
-    int give_msg)
-{
-#ifdef FEAT_GUI_MSWIN
-    return TRUE;	/* GUI starts a new console anyway */
-#else
-    if (g_PlatformId == VER_PLATFORM_WIN32_NT || Columns == 80)
-	return TRUE;
-    if (give_msg)
-	msg((char_u *)
-		_("'columns' is not 80, cannot execute external commands"));
-    return FALSE;
-#endif
-}
 
 #ifdef FEAT_GUI_MSWIN
 /*
@@ -859,10 +815,8 @@ mch_char_avail(void)
 /*
  * set screen mode, always fails.
  */
-/*ARGSUSED*/
     int
-mch_screenmode(
-    char_u *arg)
+mch_screenmode(char_u *arg UNUSED)
 {
     EMSG(_(e_screenmode));
     return FAIL;
@@ -875,17 +829,10 @@ mch_screenmode(
  * and returns an allocated string.
  * Return OK if it worked, FAIL if not.
  */
-# ifdef WIN3264
 typedef LPTSTR (*MYSTRPROCSTR)(LPTSTR);
 typedef LPTSTR (*MYINTPROCSTR)(int);
 typedef int (*MYSTRPROCINT)(LPTSTR);
 typedef int (*MYINTPROCINT)(int);
-# else
-typedef LPSTR (*MYSTRPROCSTR)(LPSTR);
-typedef LPSTR (*MYINTPROCSTR)(int);
-typedef int (*MYSTRPROCINT)(LPSTR);
-typedef int (*MYINTPROCINT)(int);
-# endif
 
 /*
  * Check if a pointer points to a valid NUL terminated string.
@@ -1045,10 +992,8 @@ mch_libcall(
 /*
  * Debugging helper: expose the MCH_WRITE_DUMP stuff to other modules
  */
-/*ARGSUSED*/
     void
-DumpPutS(
-    const char *psz)
+DumpPutS(const char *psz UNUSED)
 {
 # ifdef MCH_WRITE_DUMP
     if (fdDump)
@@ -1081,7 +1026,7 @@ Trace(
 #endif //_DEBUG
 
 #if !defined(FEAT_GUI) || defined(PROTO)
-# if defined(FEAT_TITLE) && defined(WIN3264)
+# ifdef FEAT_TITLE
 extern HWND g_hWnd;	/* This is in os_win32.c. */
 # endif
 
@@ -1102,7 +1047,7 @@ GetConsoleHwnd(void)
     if (s_hwnd != 0)
 	return;
 
-# if defined(FEAT_TITLE) && defined(WIN3264)
+# ifdef FEAT_TITLE
     /* Window handle may have been found by init code (Windows NT only) */
     if (g_hWnd != 0)
     {
@@ -1222,9 +1167,12 @@ swap_me(COLORREF colorref)
 # define PDP_RETVAL INT_PTR
 #endif
 
-/*ARGSUSED*/
     static PDP_RETVAL CALLBACK
-PrintDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+PrintDlgProc(
+	HWND hDlg,
+	UINT message,
+	WPARAM wParam UNUSED,
+	LPARAM lParam UNUSED)
 {
 #ifdef FEAT_GETTEXT
     NONCLIENTMETRICS nm;
@@ -1285,9 +1233,8 @@ PrintDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
     return FALSE;
 }
 
-/*ARGSUSED*/
     static BOOL CALLBACK
-AbortProc(HDC hdcPrn, int iCode)
+AbortProc(HDC hdcPrn UNUSED, int iCode UNUSED)
 {
     MSG msg;
 
@@ -1527,7 +1474,6 @@ mch_print_init(prt_settings_T *psettings, char_u *jobname, int forceit)
 	    )
     {
 	prt_dlg.Flags |= PD_RETURNDEFAULT;
-#ifdef WIN3264
 	/*
 	 * MSDN suggests setting the first parameter to WINSPOOL for
 	 * NT, but NULL appears to work just as well.
@@ -1535,7 +1481,6 @@ mch_print_init(prt_settings_T *psettings, char_u *jobname, int forceit)
 	if (*p_pdev != NUL)
 	    prt_dlg.hDC = CreateDC(NULL, (LPCSTR)p_pdev, NULL, NULL);
 	else
-#endif
 	{
 	    prt_dlg.Flags |= PD_RETURNDEFAULT;
 	    if (PrintDlg(&prt_dlg) == 0)
@@ -1581,10 +1526,8 @@ mch_print_init(prt_settings_T *psettings, char_u *jobname, int forceit)
     mem = (DEVMODE *)GlobalLock(prt_dlg.hDevMode);
     if (mem != NULL)
     {
-#ifdef WIN3264
 	if (mem->dmCopies != 1)
 	    stored_nCopies = mem->dmCopies;
-#endif
 	if ((mem->dmFields & DM_DUPLEX) && (mem->dmDuplex & ~DMDUP_SIMPLEX))
 	    psettings->duplex = TRUE;
 	if ((mem->dmFields & DM_COLOR) && (mem->dmColor & DMCOLOR_COLOR))
@@ -1672,7 +1615,9 @@ mch_print_init(prt_settings_T *psettings, char_u *jobname, int forceit)
 
 	if (psettings->n_uncollated_copies == 0)
 	    psettings->n_uncollated_copies = 1;
-    } else {
+    }
+    else
+    {
 	psettings->n_collated_copies = 1;
 	psettings->n_uncollated_copies = 1;
     }
@@ -1734,9 +1679,8 @@ mch_print_begin(prt_settings_T *psettings)
     return (ret > 0);
 }
 
-/*ARGSUSED*/
     void
-mch_print_end(prt_settings_T *psettings)
+mch_print_end(prt_settings_T *psettings UNUSED)
 {
     EndDoc(prt_dlg.hDC);
     if (!*bUserAbort)
@@ -1941,7 +1885,7 @@ shortcut_errorw:
 		goto shortcut_end;
 	    }
 	}
-	/* Retry with non-wide function (for Windows 98). */
+	goto shortcut_end;
     }
 # endif
     // create a link manager object and request its interface
@@ -2669,7 +2613,6 @@ charset_pairs[] =
     {"OEM",		OEM_CHARSET},
     {"SHIFTJIS",	SHIFTJIS_CHARSET},
     {"SYMBOL",		SYMBOL_CHARSET},
-#ifdef WIN3264
     {"ARABIC",		ARABIC_CHARSET},
     {"BALTIC",		BALTIC_CHARSET},
     {"EASTEUROPE",	EASTEUROPE_CHARSET},
@@ -2681,10 +2624,8 @@ charset_pairs[] =
     {"RUSSIAN",		RUSSIAN_CHARSET},
     {"THAI",		THAI_CHARSET},
     {"TURKISH",		TURKISH_CHARSET},
-# if (!defined(_MSC_VER) || (_MSC_VER > 1010)) \
-	&& (!defined(__BORLANDC__) || (__BORLANDC__ > 0x0500))
+#ifdef VIETNAMESE_CHARSET
     {"VIETNAMESE",	VIETNAMESE_CHARSET},
-# endif
 #endif
     {NULL,		0}
 };
@@ -2818,12 +2759,11 @@ points_to_pixels(char_u *str, char_u **end, int vertical, long_i pprinter_dc)
     return pixels;
 }
 
-/*ARGSUSED*/
     static int CALLBACK
 font_enumproc(
     ENUMLOGFONT	    *elf,
-    NEWTEXTMETRIC   *ntm,
-    int		    type,
+    NEWTEXTMETRIC   *ntm UNUSED,
+    int		    type UNUSED,
     LPARAM	    lparam)
 {
     /* Return value:
@@ -2949,7 +2889,7 @@ get_logfont(
      */
     for (p = name; *p && *p != ':'; p++)
     {
-	if (p - name + 1 > LF_FACESIZE)
+	if (p - name + 1 >= LF_FACESIZE)
 	    goto theend;			/* Name too long */
 	lf->lfFaceName[p - name] = *p;
     }
